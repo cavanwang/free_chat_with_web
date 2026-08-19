@@ -12,6 +12,13 @@ from typing import AsyncGenerator, Optional
 from aiohttp import web
 from playwright.async_api import async_playwright
 
+# macOS libedit 对 CJK 字符的退格有 bug, 用 gnureadline 替换
+try:
+    import gnureadline
+    sys.modules['readline'] = gnureadline
+except ImportError:
+    pass
+
 
 # ============ 配置区 ============
 CHROME_PATH = r"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -627,7 +634,7 @@ AUTO_SLIDE_CAPTCHA = True  # 自动尝试滑动滑块(失败后回退到手动�
 SLIDE_MAX_RETRIES = 3      # 自动滑动最大重试次数
 
 async def _locate_slider_from_screenshot(screenshot_path: str, dpr: float = 1.0):
-    """从截图中定位滑块的手柄和轨道位置, 返回 CSS 像素坐标 (handle_x, handle_y, track_width)
+    """从截图中定位滑块的手柄和轨道位置, 返回 CSS 像素坐标
     返回 None 表示定位失败"""
     try:
         import cv2
@@ -635,166 +642,172 @@ async def _locate_slider_from_screenshot(screenshot_path: str, dpr: float = 1.0)
 
         img = cv2.imread(screenshot_path)
         if img is None:
+            log("   [debug] 截图读取失败")
             return None
         h, w = img.shape[:2]
-
-        # 如果 DPR != 1, 截图尺寸是 CSS 像素的 DPR 倍
-        # 我们需要返回 CSS 像素坐标(用于 page.mouse)
         scale = 1.0 / dpr if dpr > 0 else 1.0
+        log(f"   [debug] 截图尺寸: {w}x{h}, scale={scale:.3f}")
 
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-        # 1. 找弹窗中心(大面积浅色背景)
-        lower_light = np.array([0, 0, 160])
-        upper_light = np.array([180, 60, 255])
+        # 1. 先找白色/浅色弹窗
+        lower_light = np.array([0, 0, 180])
+        upper_light = np.array([180, 50, 255])
         light_mask = cv2.inRange(hsv, lower_light, upper_light)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 20))
         light_closed = cv2.morphologyEx(light_mask, cv2.MORPH_CLOSE, kernel)
         contours, _ = cv2.findContours(light_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        popup_center_x, popup_center_y = w // 2, h // 2
-        popup_w, popup_h = w, h
-        for cnt in contours:
+        popup = None
+        found_popups = []
+        for cnt in sorted(contours, key=cv2.contourArea, reverse=True):
             area = cv2.contourArea(cnt)
-            if area > 30000:  # 大区域 = 弹窗
+            if area > 20000:
                 x, y, cw, ch = cv2.boundingRect(cnt)
-                popup_center_x = x + cw // 2
-                popup_center_y = y + ch // 2
-                popup_w, popup_h = cw, ch
-                break
+                center_x = x + cw/2
+                found_popups.append((x, y, cw, ch, area))
+                log(f"   [debug] 发现浅色区域: 位置({x},{y}), 尺寸{cw}x{ch}, 面积{area:.0f}, 中心({center_x:.0f},{y+ch/2:.0f})")
+                if abs(center_x - w/2) < w/3 and popup is None:
+                    popup = (x, y, cw, ch)
+                    log(f"   [debug] 选定弹窗区域: {popup}")
 
-        # 2. 在弹窗附近区域找滑块轨道(灰色长条)
-        # 裁剪弹窗区域加边距
-        margin = 100
-        roi_x1 = max(0, int(popup_center_x - popup_w // 2 - margin))
-        roi_y1 = max(0, int(popup_center_y - popup_h // 2 - margin))
-        roi_x2 = min(w, int(popup_center_x + popup_w // 2 + margin))
-        roi_y2 = min(h, int(popup_center_y + popup_h // 2 + margin))
+        if popup is None:
+            log("   [debug] 未找到弹窗, 使用默认中心区域")
+            cx, cy = w // 2, h // 2
+            popup = (cx - 250, cy - 200, 500, 400)
+
+        px, py, pw, ph = popup
+
+        # 2. 裁剪弹窗区域
+        roi_x1 = max(0, px + 20)
+        roi_y1 = max(0, py + ph // 2)
+        roi_x2 = min(w, px + pw - 20)
+        roi_y2 = min(h, py + ph - 30)
         roi = img[roi_y1:roi_y2, roi_x1:roi_x2]
 
+        log(f"   [debug] 搜索区域: ({roi_x1},{roi_y1})-({roi_x2},{roi_y2}), 尺寸{roi.shape[1]}x{roi.shape[0]}")
+
         if roi.size == 0:
+            log("   [debug] ROI 为空")
             return None
 
-        roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        # 3. 找灰色轨道: 低饱和度 + 中等亮度
-        lower_gray = np.array([0, 0, 130])
-        upper_gray = np.array([180, 30, 200])
-        gray_mask = cv2.inRange(roi_hsv, lower_gray, upper_gray)
-        gray_closed = cv2.morphologyEx(gray_mask, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(gray_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 3. 用边缘检测找矩形滑块轨道
+        edges = cv2.Canny(roi_gray, 20, 80)
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 1))
+        edges_dilated = cv2.dilate(edges, kernel_h, iterations=2)
+        edges_closed = cv2.morphologyEx(edges_dilated, cv2.MORPH_CLOSE, kernel_h)
+
+        track_contours, _ = cv2.findContours(edges_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        log(f"   [debug] 边缘检测找到 {len(track_contours)} 个轮廓")
 
         best_track = None
-        for cnt in contours:
+        track_candidates = []
+        for cnt in track_contours:
             area = cv2.contourArea(cnt)
-            if area < 500:
+            if area < 100:
                 continue
             x, y, cw, ch = cv2.boundingRect(cnt)
-            aspect = cw / ch if ch > 0 else 0
-            # 轨道特征: 宽度大, 高度适中, 宽高比 > 4
-            if cw > 100 and 15 <= ch <= 80 and aspect > 4:
+            aspect = cw / max(ch, 1)
+            if cw > 150 and 10 <= ch <= 60 and aspect > 6:
+                track_candidates.append((roi_x1 + x, roi_y1 + y, cw, ch, area, aspect))
+                log(f"   [debug] 候选轨道: 位置({roi_x1+x},{roi_y1+y}), 尺寸{cw}x{ch}, 宽高比{aspect:.1f}, 面积{area:.0f}")
                 if best_track is None or cw * ch > best_track[2] * best_track[3]:
-                    best_track = (x, y, cw, ch)
+                    best_track = (roi_x1 + x, roi_y1 + y, cw, ch)
 
+        # 备选: 颜色检测
         if best_track is None:
-            # 备选: 找边缘矩形
-            edges = cv2.Canny(roi_gray, 30, 100)
-            edge_contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in edge_contours:
+            log("   [debug] 边缘检测未找到轨道, 尝试颜色检测...")
+            roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            lower_gray = np.array([0, 0, 150])
+            upper_gray = np.array([180, 40, 230])
+            gray_mask = cv2.inRange(roi_hsv, lower_gray, upper_gray)
+            gray_closed = cv2.morphologyEx(gray_mask, cv2.MORPH_CLOSE, kernel)
+            contours2, _ = cv2.findContours(gray_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            for cnt in contours2:
                 area = cv2.contourArea(cnt)
                 if area < 500:
                     continue
                 x, y, cw, ch = cv2.boundingRect(cnt)
-                aspect = cw / ch if ch > 0 else 0
-                if cw > 100 and 15 <= ch <= 80 and aspect > 4:
+                aspect = cw / max(ch, 1)
+                if cw > 150 and 10 <= ch <= 60 and aspect > 5:
+                    log(f"   [debug] 颜色检测候选轨道: 位置({roi_x1+x},{roi_y1+y}), 尺寸{cw}x{ch}, 宽高比{aspect:.1f}")
                     if best_track is None or cw * ch > best_track[2] * best_track[3]:
-                        best_track = (x, y, cw, ch)
+                        best_track = (roi_x1 + x, roi_y1 + y, cw, ch)
 
         if best_track is None:
+            log("   [debug] 未找到滑块轨道")
             return None
 
-        tx, ty, tw, th = best_track
-        # 转换回全图坐标
-        track_x = tx + roi_x1
-        track_y = ty + roi_y1
-        track_w = tw
-        track_h = ch
+        track_x, track_y, track_w, track_h = best_track
+        log(f"   [debug] 选定轨道: ({track_x},{track_y}), 宽{track_w}, 高{track_h}")
 
-        # 4. 在轨道上或附近找白色手柄
-        # 搜索轨道区域及上下扩展
-        handle_search_x1 = max(0, track_x - 20)
-        handle_search_y1 = max(0, track_y - 30)
-        handle_search_x2 = min(w, track_x + track_w + 20)
-        handle_search_y2 = min(h, track_y + track_h + 30)
+        # 4. 找滑块手柄
+        handle_search_x1 = max(0, track_x - 10)
+        handle_search_y1 = max(0, track_y - 20)
+        handle_search_x2 = min(w, track_x + track_w + 10)
+        handle_search_y2 = min(h, track_y + track_h + 20)
         handle_roi = img[handle_search_y1:handle_search_y2, handle_search_x1:handle_search_x2]
 
         handle_hsv = cv2.cvtColor(handle_roi, cv2.COLOR_BGR2HSV)
         handle_gray = cv2.cvtColor(handle_roi, cv2.COLOR_BGR2GRAY)
 
-        # 白色检测: 高亮度 + 低饱和度
         lower_white = np.array([0, 0, 200])
-        upper_white = np.array([180, 80, 255])
+        upper_white = np.array([180, 60, 255])
         white_mask = cv2.inRange(handle_hsv, lower_white, upper_white)
-        white_closed = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
-        handle_contours, _ = cv2.findContours(white_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        _, bright_mask = cv2.threshold(handle_gray, 200, 255, cv2.THRESH_BINARY)
+        combined_mask = cv2.bitwise_or(white_mask, bright_mask)
 
+        handle_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        combined_closed = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, handle_kernel)
+        handle_contours, _ = cv2.findContours(combined_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        track_cy = track_y + track_h / 2
         best_handle = None
-        track_center_y = track_y + track_h / 2
+
+        log(f"   [debug] 手柄搜索区域: ({handle_search_x1},{handle_search_y1})-({handle_search_x2},{handle_search_y2})")
+        log(f"   [debug] 找到 {len(handle_contours)} 个候选手柄轮廓")
 
         for cnt in handle_contours:
             area = cv2.contourArea(cnt)
-            if area < 200 or area > 8000:
+            if area < 100 or area > 5000:
                 continue
             hx, hy, hw, hh = cv2.boundingRect(cnt)
-            # 手柄特征: 宽度中等, 高度适中, 在轨道 Y 附近
-            if 20 <= hw <= 100 and 15 <= hh <= 60:
-                handle_cx = handle_search_x1 + hx + hw / 2
-                handle_cy = handle_search_y1 + hy + hh / 2
-                # 检查是否在轨道 Y 范围内
-                if abs(handle_cy - track_center_y) < track_h / 2 + 20:
-                    if best_handle is None or area > best_handle[4]:
-                        best_handle = (handle_search_x1 + hx, handle_search_y1 + hy, hw, hh, area)
+            handle_cx = handle_search_x1 + hx + hw / 2
+            handle_cy = handle_search_y1 + hy + hh / 2
+            cy_diff = abs(handle_cy - track_cy)
+            if cy_diff < track_h / 2 + 15:
+                log(f"   [debug] 候选手柄: 位置({handle_cx:.0f},{handle_cy:.0f}), 尺寸{hw}x{hh}, 面积{area:.0f}, Y差{cy_diff:.0f}")
+                if best_handle is None or area > best_handle[4]:
+                    best_handle = (handle_search_x1 + hx, handle_search_y1 + hy, hw, hh, area)
 
         if best_handle is None:
-            # 备选: 用亮度阈值
-            _, bright_mask = cv2.threshold(handle_gray, 200, 255, cv2.THRESH_BINARY)
-            bright_closed = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE, kernel)
-            bright_contours, _ = cv2.findContours(bright_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in bright_contours:
-                area = cv2.contourArea(cnt)
-                if area < 200 or area > 8000:
-                    continue
-                hx, hy, hw, hh = cv2.boundingRect(cnt)
-                if 20 <= hw <= 100 and 15 <= hh <= 60:
-                    handle_cx = handle_search_x1 + hx + hw / 2
-                    handle_cy = handle_search_y1 + hy + hh / 2
-                    if abs(handle_cy - track_center_y) < track_h / 2 + 20:
-                        if best_handle is None or area > best_handle[4]:
-                            best_handle = (handle_search_x1 + hx, handle_search_y1 + hy, hw, hh, area)
-
-        if best_handle is None:
+            log("   [debug] 未找到滑块手柄")
             return None
 
         hx, hy, hw, hh, _ = best_handle
-        handle_center_x = hx + hw / 2
-        handle_center_y = hy + hh / 2
+        handle_cx = hx + hw / 2
+        handle_cy = hy + hh / 2
 
-        # 5. 转换为 CSS 像素坐标
         result = {
-            "handle_x": handle_center_x * scale,
-            "handle_y": handle_center_y * scale,
+            "handle_x": handle_cx * scale,
+            "handle_y": handle_cy * scale,
             "track_width": track_w * scale,
             "track_height": track_h * scale,
             "handle_width": hw * scale,
             "handle_height": hh * scale,
-            "total_distance": (track_w - hw) * scale,  # 需要拖动的距离
+            "total_distance": (track_w - hw) * scale,
             "screenshot_size": {"width": w, "height": h},
             "css_size": {"width": int(w * scale), "height": int(h * scale)},
         }
+        log(f"   [debug] 定位成功: 手柄({result['handle_x']:.0f},{result['handle_y']:.0f}), 轨道宽{result['track_width']:.0f}, 移动距离{result['total_distance']:.0f}")
         return result
 
-    except Exception:
+    except Exception as e:
+        log(f"   [debug] 定位异常: {e}")
         return None
 
 

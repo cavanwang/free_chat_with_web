@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import AsyncGenerator, Optional
 from playwright.async_api import async_playwright
 
+# macOS libedit 对 CJK 字符的退格有 bug, 用 gnureadline 替换
+try:
+    import gnureadline
+    sys.modules['readline'] = gnureadline
+except ImportError:
+    pass
+
 
 # ============ 配置区 ============
 CHROME_PATH = r"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
