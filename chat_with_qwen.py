@@ -968,16 +968,16 @@ async def _try_auto_slide_captcha(page):
 _last_mouse_jitter = 0
 def _human_keystroke_delay_ms(prev_char: str, curr_char: str) -> int:
     import random, math
-    # 对数正态分布：中位数 ~80ms, σ=0.35
-    base = random.lognormvariate(math.log(0.08), 0.35) * 1000
+    # 对数正态分布：中位数 ~53ms, σ=0.30
+    base = random.lognormvariate(math.log(0.053), 0.30) * 1000
     # 标点前减速（当前字符是标点）
     if curr_char in "，。！？；：、,.!?;:":
-        base *= 1.8
+        base *= 1.6
     # 句末长停顿（前一个字符是句末标点）
     if prev_char in "。！？!?":
-        base += random.uniform(300, 800)
-    # 生理下限 45ms
-    return max(int(base), 45)
+        base += random.uniform(200, 550)
+    # 生理下限 35ms
+    return max(int(base), 35)
 
 async def mouse_jitter(page):
     global _last_mouse_jitter
@@ -2516,8 +2516,8 @@ async def main():
                         await page.wait_for_timeout(delay)
                         prev_ch = ch
                     if i < len(chunks) - 1:
-                        await page.wait_for_timeout(random.randint(180, 520))
-                await page.wait_for_timeout(random.randint(300, 700))
+                        await page.wait_for_timeout(random.randint(120, 350))
+                await page.wait_for_timeout(random.randint(200, 470))
                 if se:
                     try:
                         sbox = await se.bounding_box()
@@ -2655,9 +2655,9 @@ async def _send_message_api(page, query):
             await page.wait_for_timeout(delay)
             prev_ch = ch
         if i < len(chunks) - 1:
-            await page.wait_for_timeout(random.randint(180, 520))
+            await page.wait_for_timeout(random.randint(120, 350))
 
-    await page.wait_for_timeout(random.randint(300, 700))
+    await page.wait_for_timeout(random.randint(200, 470))
 
     if se:
         try:
