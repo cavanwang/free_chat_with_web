@@ -18,6 +18,17 @@ try:
 except ImportError:
     pass
 
+# 斜杠命令 TUI 面板（输入 / 弹出命令菜单）
+from cmd_palette import prompt_query, print_help, normalize_command
+
+# 交互式命令注册表: 输入 / 触发 TUI 菜单, 命令名 -> 说明
+COMMANDS = {
+    "/help":      "查看所有命令列表",
+    "/chatmodes": "查看对话模式列表",
+    "/mode":      "切换对话模式, 用法: /mode <模式名>",
+    "/quit":      "退出程序",
+}
+
 
 # ============ 配置区 ============
 CHROME_PATH = r"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -1217,21 +1228,24 @@ async def main():
 
         round_num = 0
         while True:
-            try:
-                query = input("You: ").strip()
-            except (EOFError, KeyboardInterrupt):
+            raw = await prompt_query("You: ", COMMANDS)
+            if raw is None:
                 break
+            query = normalize_command(raw, COMMANDS)
             if not query or query.lower() == "quit":
                 break
-            if query.strip() == "chatmodes":
+            if query.lower() == "help":
+                print_help(COMMANDS, "DeepSeek 交互命令")
+                continue
+            if query.lower() == "chatmodes":
                 await list_chat_modes(page)
                 continue
-            if query.strip().lower().startswith("mode "):
+            if query.lower().startswith("mode "):
                 mn = query.strip()[5:].strip()
                 await switch_chat_mode(page, mn)
                 continue
-            if query.strip() == "mode":
-                log("用法: mode <模式名>  (快速模式 / 专家模式 / 识图模式)")
+            if query.lower() == "mode":
+                log("用法: /mode <模式名>  (快速模式 / 专家模式 / 识图模式)")
                 continue
 
             round_num += 1

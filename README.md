@@ -55,15 +55,16 @@ pip install opencv-python-headless numpy  # 千问自动滑动需要
 python chat_deepseek_web.py
 ```
 
-交互式命令:
+交互式命令（输入 `/` 弹出 TUI 命令菜单，方向键选择，回车确认）:
 ```
 You: <输入消息>     # 发送聊天
-models             # 查看可用模型列表
-model <模型名>      # 切换模型
-chatmodes          # 查看对话模式
-chatmode <模式名>   # 切换对话模式
-quit               # 退出
+/help              # 查看所有命令
+/chatmodes         # 查看对话模式
+/mode <模式名>      # 切换对话模式 (快速模式 / 专家模式 / 识图模式)
+/quit              # 退出
 ```
+
+> 提示: 直接输入 `/` 即可弹出命令列表悬浮菜单；旧的无前缀命令（`chatmodes`、`mode`、`quit`）仍兼容可用。
 
 ### API 服务器模式
 
@@ -121,15 +122,18 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 python chat_with_qwen.py
 ```
 
-交互式命令(同 DeepSeek):
+交互式命令（输入 `/` 弹出 TUI 命令菜单，方向键选择，回车确认）:
 ```
-You: <输入消息>
-models
-model <模型名>
-chatmodes
-chatmode <模式名>
-quit
+You: <输入消息>     # 发送聊天
+/help              # 查看所有命令
+/models            # 查看可用模型列表
+/model <模型名>     # 切换模型
+/chatmodes         # 查看对话模式
+/chatmode <模式名>  # 切换对话模式
+/quit              # 退出
 ```
+
+> 提示: 直接输入 `/` 即可弹出命令列表悬浮菜单；旧的无前缀命令（`models`、`model`、`chatmodes`、`chatmode`、`quit`）仍兼容可用。
 
 ### API 服务器模式
 

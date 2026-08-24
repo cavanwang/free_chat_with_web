@@ -1,0 +1,36 @@
+# ===== Python =====
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ===== Node =====
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ===== 环境变量 / 密钥 =====
+.env
+*.env
+!.env.example
+
+# ===== 运行时输出 / 缓存 =====
+logs/
+midscene-computer/midscene_run/
+midscene-computer/screenshots/
+raw_dumps/
+raw_dumps_qwen/
+*_curl_req_resp.data
+
+# ===== Chrome 用户数据（运行时生成, 含登录态）=====
+deepseek_chrome_profile/
+qwen_chrome_profile/
+*_chrome_profile/
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
