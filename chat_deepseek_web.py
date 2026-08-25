@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import AsyncGenerator, Optional
 from playwright.async_api import async_playwright
 
+import session_store              # 与 qwen 共享的会话历史存储(网关持有会话正本)
+import gateway_common as gwc      # 与 qwen 共用的上下文拼装/等待判定纯逻辑
+
 # macOS libedit 对 CJK 字符的退格有 bug, 用 gnureadline 替换
 try:
     import gnureadline
@@ -36,7 +39,7 @@ DEBUG_PORT = 9222
 USER_DATA_DIR = Path("./deepseek_chrome_profile")
 DEEPSEEK_URL = "https://chat.deepseek.com/"
 DEEPSEEK_HOST = "chat.deepseek.com"
-HEADLESS = False
+HEADLESS = False  # 默认有头模式, 可实时看到画面并手动交互
 LOGIN_TIMEOUT_SEC = 600
 REUSE_EXISTING_TAB = True
 DUMP_RAW = True
@@ -396,6 +399,16 @@ async def _reset_to_home(page):
     except Exception as e:
         log(f"   ❌ 导航失败: {e}")
         return False
+
+
+async def start_new_chat(page):
+    """开启一个干净的新会话。DeepSeek 里导航回首页(_reset_to_home)即为全新会话。
+    返回可用的 page(与入参相同, 同标签页内)。
+    """
+    ok = await _reset_to_home(page)
+    if not ok:
+        log("⚠️ 新建会话(重置首页)失败, 继续尝试当前页面")
+    return page
 
 
 async def switch_chat_mode(page, mode_name):
@@ -762,14 +775,13 @@ async def stream_chat_gen(page, send_coro, round_num, idle_timeout=3):
         await send_coro
         log("开始接收流式数据...")
 
-        last_active = time.time()
-        last_text_len = 0
+        ctx = gwc.new_wait_ctx()
         hook_source_logged = False
 
         while True:
             try:
                 kind, data = await asyncio.wait_for(chunk_queue.get(), timeout=0.2)
-                last_active = time.time()
+                ctx["last_active"] = time.time()
 
                 if kind == "done":
                     finished_by_signal = True
@@ -799,6 +811,7 @@ async def stream_chat_gen(page, send_coro, round_num, idle_timeout=3):
                         yield ("body", data)
 
             except asyncio.TimeoutError:
+                cur_len = ctx["last_text_len"]
                 try:
                     state = await page.evaluate(POLL_STATE_JS)
                     cur_len = state.get("textLen", 0)
@@ -825,18 +838,18 @@ async def stream_chat_gen(page, send_coro, round_num, idle_timeout=3):
                                 break
                         break
 
-                    if cur_len > 0 and cur_len == last_text_len:
-                        if time.time() - last_active > idle_timeout:
-                            log(f"⚠️ {idle_timeout}s 无新数据 (textLen={cur_len})，兜底结束")
-                            break
-                    else:
-                        last_text_len = cur_len
-                        last_active = time.time()
-
                 except Exception as poll_err:
-                    if time.time() - last_active > idle_timeout:
-                        log(f"⚠️ 轮询异常且超时: {poll_err}")
-                        break
+                    log(f"⚠️ 轮询异常: {poll_err}")
+
+                # 统一空闲判定(含硬上限, 修掉无限等待)。DeepSeek 无验证码 -> captcha_present=False
+                action, reason = gwc.idle_decision(
+                    ctx, False, cur_len, bool(live_parts), idle_timeout,
+                    overall_timeout=STREAM_OVERALL_TIMEOUT,
+                    first_token_timeout=FIRST_TOKEN_TIMEOUT,
+                )
+                if action == "break":
+                    log(f"⚠️ {reason}")
+                    break
 
         final_body = "".join(live_parts)
         final_think = "".join(think_parts)
@@ -930,6 +943,68 @@ def estimate_tokens(text: str) -> int:
     return max(1, int(chinese_chars * 1.5 + english_words * 1.3 + other_chars * 0.5))
 
 
+# ============ \u4f1a\u8bdd\u6458\u8981 / \u538b\u7f29(\u4e0e qwen \u5bf9\u9f50) ============
+
+async def _collect_web_reply(page, prompt_text, round_num):
+    """\u5728\u5f53\u524d(\u5df2\u65b0\u5efa\u7684)\u4f1a\u8bdd\u91cc\u53d1\u9001 prompt_text \u5e76\u5b8c\u6574\u6536\u96c6\u56de\u590d, \u8fd4\u56de (body, think)\u3002\u7528\u4e8e\u6458\u8981\u3002"""
+    final_body = ""
+    final_think = ""
+    async for kind, data in stream_chat_gen(page, do_send(page, prompt_text), round_num):
+        if kind == "body":
+            final_body += data
+        elif kind == "think":
+            final_think += data
+        elif kind == "done":
+            final_body = data.get("body", final_body)
+            final_think = data.get("think", final_think)
+    return final_body, final_think
+
+
+async def maybe_compact(page, cid, round_num):
+    """\u4f1a\u8bdd\u7d2f\u8ba1\u4f30\u7b97 token \u8d85\u9608\u503c\u65f6\u538b\u7f29: \u53e6\u5f00\u5e72\u51c0\u4f1a\u8bdd\u8ba9\u6a21\u578b\u628a[\u65e7\u6458\u8981+\u88ab\u6298\u53e0\u539f\u6587]\u538b\u6210\u65b0\u6458\u8981,
+    \u53ea\u4fdd\u7559\u6700\u8fd1 K \u6761\u539f\u6587\u3002\u6458\u8981\u5931\u8d25\u5219\u9000\u5316\u4e3a"\u4fdd\u7559\u65e7\u6458\u8981 + \u6700\u8fd1 K \u6761"\u3002\u8fd4\u56de\u662f\u5426\u53d1\u751f\u538b\u7f29\u3002
+    """
+    state = session_store.load(SESSION_DB_PATH, cid)
+    if state["total_tokens"] <= COMPACT_SOFT_LIMIT:
+        return False
+
+    turns = state["turns"]
+    keep = turns[-COMPACT_KEEP_RECENT:] if COMPACT_KEEP_RECENT > 0 else []
+    fold = turns[:len(turns) - len(keep)]
+
+    conv_parts = []
+    if state["summary"]:
+        conv_parts.append("\u6b64\u524d\u6458\u8981:\n" + state["summary"])
+    if fold:
+        conv_parts.append(gwc.render_turns(fold))
+    conversation_text = "\n\n".join(conv_parts).strip()
+    if not conversation_text:
+        return False
+
+    log(f"\ud83e\uddec \u89e6\u53d1\u4f1a\u8bdd\u538b\u7f29 cid={cid} (\u7d2f\u8ba1~{state['total_tokens']} tokens)")
+    prompt = COMPACT_PROMPT_TEMPLATE.format(
+        max_chars=COMPACT_SUMMARY_MAX_CHARS, conversation=conversation_text
+    )
+    try:
+        page2 = await start_new_chat(page)
+        _app_state["page"] = page2
+        body, _think = await _collect_web_reply(page2, prompt, round_num)
+        new_summary = (body or "").strip()
+        if not new_summary:
+            raise RuntimeError("\u6458\u8981\u4e3a\u7a7a")
+        session_store.replace_after_compaction(
+            SESSION_DB_PATH, cid, new_summary, estimate_tokens(new_summary), keep
+        )
+        log(f"\ud83e\uddec \u538b\u7f29\u5b8c\u6210: \u6458\u8981 {len(new_summary)} \u5b57, \u4fdd\u7559\u6700\u8fd1 {len(keep)} \u6761\u539f\u6587")
+        return True
+    except Exception as e:
+        log(f"\u26a0\ufe0f \u538b\u7f29\u5931\u8d25({type(e).__name__}: {e}), \u9000\u5316\u4e3a\u4fdd\u7559\u6700\u8fd1 {len(keep)} \u6761")
+        session_store.replace_after_compaction(
+            SESSION_DB_PATH, cid, state["summary"], state["summary_tokens"], keep
+        )
+        return True
+
+
 # ============================================================
 # FastAPI 应用（OpenAI 兼容）
 # ============================================================
@@ -946,6 +1021,28 @@ SUPPORTED_MODELS = [
 ]
 
 _app_state: dict = {"page": None, "browser": None, "lock": None, "round_counter": 0}
+
+# ============ 会话网关化 / 摘要压缩 / 超时中止(与 qwen 对齐, 共享同一 SQLite) ============
+SESSION_DB_PATH = str(Path(__file__).resolve().parent / "sessions.db")  # 与 qwen 同一库, 跨进程共享会话
+DEFAULT_CONVERSATION_ID = "default"   # 客户端不传 conversation_id 时的兜底会话
+COMPACT_SOFT_LIMIT = 24000            # 会话累计估算 token 超过此值触发压缩
+COMPACT_KEEP_RECENT = 3               # 压缩时保留最近轮数(user+assistant 计为多条)
+COMPACT_SUMMARY_MAX_CHARS = 300       # 摘要长度约束
+
+STREAM_OVERALL_TIMEOUT = 180          # 单轮硬上限秒数
+FIRST_TOKEN_TIMEOUT = 60              # 无验证时等待首个回复 token 的上限秒数
+# DeepSeek 无滑块验证: idle_decision 走 allow_restart=False、captcha_present=False 分支
+
+CONTEXT_HEADER = (
+    "以下 <wxg_summary> 是此前对话摘要, <wxg_history> 是最近若干轮原文(每个 <wxg_turn> 含 n=轮次、role=角色), "
+    "<wxg_current> 是我当前的问题。请在此背景上继续回答, 不要复述背景本身。"
+)
+COMPACT_PROMPT_TEMPLATE = (
+    "请把下面这段多轮对话压缩成一份简洁摘要, 只保留后续继续对话所必需的信息: "
+    "关键事实、已达成的结论、尚未解决的问题、重要前提与用户偏好。"
+    "用要点列出, 不要展开寒暄与客套, 不超过{max_chars}字。只输出摘要本身, 不要额外说明。\n\n"
+    "====== 对话开始 ======\n{conversation}\n====== 对话结束 ======"
+)
 
 
 def _check_api_key(request: Request) -> Optional[str]:
@@ -977,8 +1074,15 @@ def _build_chat_chunk(content: str = "", reasoning: str = "", model: str = "deep
     }
 
 
-def _build_chat_response(content: str, reasoning: str, model: str, chat_id: str) -> dict:
-    prompt_tokens = estimate_tokens(reasoning) + estimate_tokens(content)
+def _build_chat_response(content: str, reasoning: str, model: str, chat_id: str,
+                         usage: Optional[dict] = None) -> dict:
+    if usage is None:
+        prompt_tokens = estimate_tokens(reasoning) + estimate_tokens(content)
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": estimate_tokens(content),
+            "total_tokens": prompt_tokens + estimate_tokens(content),
+        }
     return {
         "id": chat_id,
         "object": "chat.completion",
@@ -993,16 +1097,20 @@ def _build_chat_response(content: str, reasoning: str, model: str, chat_id: str)
             },
             "finish_reason": "stop",
         }],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": estimate_tokens(content),
-            "total_tokens": prompt_tokens + estimate_tokens(content),
-        },
+        "usage": usage,
     }
 
 
 def create_app():
     app = FastAPI(title="DeepSeek Web Hook API", version="1.0")
+
+    @app.get("/")
+    async def root():
+        return {"status": "ok", "service": "deepseek-web-api"}
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "service": "deepseek-web-api"}
 
     @app.get("/v1/models")
     async def list_models():
@@ -1042,6 +1150,9 @@ def create_app():
         model = body.get("model", "deepseek-chat")
         stream = body.get("stream", False)
         req_mode = body.get("mode", "")  # "expert" / "vision" / "default"
+        # 会话正本由网关持有: conversation_id 标识调用方逻辑会话(与 qwen 共享同一库)
+        cid = body.get("conversation_id") or DEFAULT_CONVERSATION_ID
+        new_session = body.get("new_session", False)
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
         page = _app_state["page"]
@@ -1049,27 +1160,59 @@ def create_app():
         if page is None or lock is None:
             return JSONResponse(status_code=503, content={"error": {"message": "Browser not ready"}})
 
+        # new_session=true 语义: 清空该 cid 历史
+        if new_session:
+            session_store.clear(SESSION_DB_PATH, cid)
+            log(f"🔄 API 清空会话历史 cid={cid}")
+
+        # 取历史正本, 拼装[摘要+最近K轮+本轮]
+        state = session_store.load(SESSION_DB_PATH, cid)
+        injected = gwc.assemble_context(state, user_msg, CONTEXT_HEADER)
+
         _app_state["round_counter"] += 1
         round_num = _app_state["round_counter"]
+        log(f"===== 第 {round_num} 轮 (API) cid={cid} 注入~{estimate_tokens(injected)} tokens =====")
 
         mode_to_label = {"default": "快速模式", "expert": "专家模式", "vision": "识图模式"}
 
-        async def _ensure_mode():
+        async def _ensure_mode(p):
             if not req_mode:
                 return
             label = mode_to_label.get(req_mode, req_mode)
-            await switch_chat_mode(page, label)
+            await switch_chat_mode(p, label)
+
+        def _persist_and_usage(final_body, final_think):
+            """落库(user+assistant)并返回 usage; 无有效回复则不落库, 避免污染上下文。"""
+            if final_body and final_body.strip():
+                try:
+                    session_store.append_turn(SESSION_DB_PATH, cid, "user", user_msg, estimate_tokens(user_msg))
+                    session_store.append_turn(SESSION_DB_PATH, cid, "assistant", final_body, estimate_tokens(final_body))
+                except Exception as e:
+                    log(f"⚠️ 历史落库失败: {type(e).__name__}: {e}")
+            else:
+                log("⚠️ 本轮无有效回复, 跳过历史落库")
+            prompt_tok = estimate_tokens(injected)
+            body_tok = estimate_tokens(final_body)
+            think_tok = estimate_tokens(final_think)
+            return {
+                "prompt_tokens": prompt_tok,
+                "completion_tokens": body_tok,
+                "reasoning_tokens": think_tok,
+                "total_tokens": prompt_tok + body_tok + think_tok,
+                "conversation_id": cid,
+            }
 
         # ========= 流式响应 =========
         async def stream_generator():
             final_body = ""
             final_think = ""
             async with lock:
-                # 1) 先在 lock 内完成模式切换（可能触发 page.goto 重置），
-                #    确保页面状态就绪后再开始 yield 任何数据
-                await _ensure_mode()
+                # 先开干净会话(导航回首页), 再切模式, 最后注入拼好的上下文
+                p = await start_new_chat(page)
+                _app_state["page"] = p
+                await _ensure_mode(p)
                 try:
-                    async for kind, data in stream_chat_gen(page, do_send(page, user_msg), round_num):
+                    async for kind, data in stream_chat_gen(p, do_send(p, injected), round_num):
                         if kind == "body":
                             final_body += data
                             yield f"data: {json.dumps(_build_chat_chunk(content=data, model=model, chunk_id=chat_id), ensure_ascii=False)}\n\n"
@@ -1083,15 +1226,14 @@ def create_app():
                     log(f"❌ API 流式异常: {type(e).__name__}: {e}")
                     yield f"data: {json.dumps(_build_chat_chunk(content=f'[error] {e}', model=model, chunk_id=chat_id), ensure_ascii=False)}\n\n"
 
-                prompt_tok = estimate_tokens(user_msg)
-                body_tok = estimate_tokens(final_body)
-                think_tok = estimate_tokens(final_think)
-                usage = {
-                    "prompt_tokens": prompt_tok,
-                    "completion_tokens": body_tok,
-                    "reasoning_tokens": think_tok,
-                    "total_tokens": prompt_tok + body_tok + think_tok,
-                }
+                usage = _persist_and_usage(final_body, final_think)
+                compacted = False
+                try:
+                    compacted = await maybe_compact(_app_state["page"], cid, _app_state["round_counter"])
+                except Exception as e:
+                    log(f"⚠️ 压缩异常: {type(e).__name__}: {e}")
+                usage["compacted"] = compacted
+                usage["session_tokens"] = session_store.load(SESSION_DB_PATH, cid)["total_tokens"]
                 yield f"data: {json.dumps(_build_chat_chunk(model=model, chunk_id=chat_id, finish='stop', usage=usage), ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
 
@@ -1102,8 +1244,10 @@ def create_app():
         final_think = ""
         async with lock:
             try:
-                await _ensure_mode()
-                async for kind, data in stream_chat_gen(page, do_send(page, user_msg), round_num):
+                p = await start_new_chat(page)
+                _app_state["page"] = p
+                await _ensure_mode(p)
+                async for kind, data in stream_chat_gen(p, do_send(p, injected), round_num):
                     if kind == "body":
                         final_body += data
                     elif kind == "think":
@@ -1115,7 +1259,31 @@ def create_app():
                 log(f"❌ API 非流式异常: {type(e).__name__}: {e}")
                 return JSONResponse(status_code=500, content={"error": {"message": str(e)}})
 
-        return _build_chat_response(final_body, final_think, model, chat_id)
+        usage = _persist_and_usage(final_body, final_think)
+        compacted = False
+        try:
+            compacted = await maybe_compact(_app_state["page"], cid, _app_state["round_counter"])
+        except Exception as e:
+            log(f"⚠️ 压缩异常: {type(e).__name__}: {e}")
+        usage["compacted"] = compacted
+        usage["session_tokens"] = session_store.load(SESSION_DB_PATH, cid)["total_tokens"]
+        return _build_chat_response(final_body, final_think, model, chat_id, usage=usage)
+
+    @app.post("/v1/session/reset")
+    async def session_reset(request: Request):
+        err = _check_api_key(request)
+        if err:
+            return JSONResponse(status_code=401, content={"error": {"message": "Invalid API key", "type": err}})
+        cid = DEFAULT_CONVERSATION_ID
+        try:
+            rbody = await request.json()
+            if isinstance(rbody, dict) and rbody.get("conversation_id"):
+                cid = rbody["conversation_id"]
+        except Exception:
+            pass
+        session_store.clear(SESSION_DB_PATH, cid)
+        log(f"🔄 已清空会话历史 cid={cid}")
+        return {"status": "ok", "message": "Session cleared", "conversation_id": cid}
 
     return app
 
@@ -1124,6 +1292,22 @@ async def run_api_server(host: str, port: int):
     import uvicorn
 
     log("脚本启动（API 模式）")
+
+    # 启动前检测端口是否已被任一 IP 占用(含 127.0.0.1 / ::1 / 通配), 占用即报错退出。
+    # 避免"打印了成功横幅但请求其实被别的服务(如抢 127.0.0.1:8000 的 Beem H)截走"的误导。
+    occupied, why = gwc.port_in_use(port)
+    if occupied:
+        log(f"❌ 端口 {port} 已被占用: {why}")
+        log(f"   请换端口启动 `--port 8001`, 或先停掉占用进程(查: lsof -nP -iTCP:{port} -sTCP:LISTEN)。")
+        return
+    log(f"✅ 端口 {port} 未被占用")
+
+    # 初始化会话历史存储(与 qwen 共享同一 SQLite, 跨进程共享同一 conversation_id)
+    try:
+        session_store.init(SESSION_DB_PATH)
+        log(f"🗄️  会话历史库: {SESSION_DB_PATH} (与 qwen 共享)")
+    except Exception as e:
+        log(f"⚠️ 会话历史库初始化失败: {type(e).__name__}: {e}")
     chrome_proc = launch_chrome()
     attached = (chrome_proc is None)
 
@@ -1161,14 +1345,20 @@ async def run_api_server(host: str, port: int):
         tab = "复用" if is_reused else "新建"
         log(f"✅ 就绪（{mode}/{tab}）")
         log(f"🚀 API 服务启动: http://{host}:{port}")
-        log(f"   POST /v1/chat/completions")
-        log(f"   GET  /v1/models")
+        log(f"   POST /v1/chat/completions  - 聊天(每轮新建会话+注入历史)")
+        log(f"   POST /v1/session/reset    - 清空会话历史(可带 conversation_id)")
+        log(f"   GET  /v1/models / /v1/modes")
+        log(f"   参数 conversation_id 区分逻辑会话(与 qwen 共享); new_session=true 清空")
+        log(f"   会话正本存于 {SESSION_DB_PATH}")
         if API_KEY:
             log(f"   API Key: {API_KEY}")
         log(f"   (Ctrl+C 退出)\n")
 
+        log("   (下方 uvicorn 'Uvicorn running on ...' 才是真正绑定成功的权威标志;")
+        log("    每次请求会打一行 access 日志, 若 curl 时此处无新日志=请求没打到本服务)")
         app = create_app()
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        # info + access_log: 打印真实绑定地址与每次请求, 便于确认"监听端口的服务正常"
+        config = uvicorn.Config(app, host=host, port=port, log_level="info", access_log=True)
         server = uvicorn.Server(config)
 
         try:

@@ -23,6 +23,7 @@ API_PORT=8765
 MIDSCENE_PORT=3456
 ENABLE_MIDSCENE=true
 API_MODE=false
+FORCE_RESTART=true
 
 # ============ Midscene 模型默认配置(千问 DashScope) ============
 # 仅当 .env 文件未设置时使用这些默认值
@@ -46,13 +47,17 @@ while [[ $# -gt 0 ]]; do
             ENABLE_MIDSCENE=false
             shift
             ;;
+        --force-restart)
+            FORCE_RESTART=true
+            shift
+            ;;
         --midscene-port)
             MIDSCENE_PORT="$2"
             shift 2
             ;;
         *)
             echo "未知参数: $1"
-            echo "用法: $0 [--api] [--port PORT] [--no-midscene]"
+            echo "用法: $0 [--api] [--port PORT] [--no-midscene] [--force-restart]"
             exit 1
             ;;
     esac
@@ -83,6 +88,27 @@ check_midscene_running() {
     fi
 }
 
+# ============ 检查 Midscene 服务是否为最新版本 ============
+check_midscene_version() {
+    local port="${1:-$MIDSCENE_PORT}"
+    local required_endpoints=("/health" "/ai_solve_slider" "/locate_slider")
+    local missing=0
+    
+    for endpoint in "${required_endpoints[@]}"; do
+        local status=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://127.0.0.1:${port}${endpoint}" 2>/dev/null)
+        if [ "$status" = "405" ] || [ "$status" = "404" ] || [ -z "$status" ]; then
+            # 405 = Method Not Allowed (GET 对 POST 端点), 也算端点存在
+            if [ "$status" != "404" ]; then
+                continue
+            fi
+            missing=$((missing + 1))
+            log_warn "端点 ${endpoint} 缺失 (HTTP ${status})"
+        fi
+    done
+    
+    return $missing  # 0 = 所有端点就绪, >0 = 有缺失
+}
+
 # ============ 启动 Midscene 服务 ============
 start_midscene() {
     if [ "$ENABLE_MIDSCENE" = "false" ]; then
@@ -90,12 +116,44 @@ start_midscene() {
         return 0
     fi
     
+    local need_restart=false
+    
     if check_midscene_running; then
         log_info "Midscene 服务已在运行 (端口 $MIDSCENE_PORT)"
-        return 0
+        
+        if [ "$FORCE_RESTART" = "true" ]; then
+            log_warn "强制重启模式: 将重建 Midscene 服务"
+            need_restart=true
+        elif ! check_midscene_version; then
+            log_warn "运行中的 Midscene 服务缺少必要端点,需要重启以加载最新代码"
+            need_restart=true
+        else
+            log_info "✅ Midscene 服务版本检查通过"
+            return 0
+        fi
+    else
+        log_info "Midscene 服务未运行,将启动新实例"
     fi
     
     log_step "启动 Midscene Computer 服务..."
+    
+    # 如果需要重启, 先杀掉旧进程
+    if [ "$need_restart" = "true" ]; then
+        log_warn "正在终止旧版 Midscene 进程..."
+        lsof -ti ":${MIDSCENE_PORT}" -sTCP:LISTEN 2>/dev/null | xargs kill 2>/dev/null || true
+        # 等待端口释放, 最多 5 秒
+        local wait_port=0
+        while [ $wait_port -lt 5 ] && lsof -i ":${MIDSCENE_PORT}" -sTCP:LISTEN > /dev/null 2>&1; do
+            sleep 1
+            wait_port=$((wait_port + 1))
+        done
+        if lsof -i ":${MIDSCENE_PORT}" -sTCP:LISTEN > /dev/null 2>&1; then
+            log_error "端口 $MIDSCENE_PORT 仍被占用,强制终止..."
+            lsof -ti ":${MIDSCENE_PORT}" -sTCP:LISTEN 2>/dev/null | xargs kill -9 2>/dev/null || true
+            sleep 1
+        fi
+        log_info "旧进程已终止"
+    fi
     
     # 检查目录是否存在
     if [ ! -d "$MIDSCENE_DIR" ]; then
@@ -151,6 +209,18 @@ start_midscene() {
             else
                 log_info "✅ Midscene 服务就绪 (agent 未初始化,首次调用时自动加载) 耗时 ${waited}s"
             fi
+            
+            # 查询 Midscene 连接的显示器信息 (后台获取, 不阻塞)
+            log_step "查询 Midscene 显示器连接..."
+            local display_info=$(curl -s --connect-timeout 2 --max-time 10 "http://127.0.0.1:${MIDSCENE_PORT}/screen_info" 2>/dev/null || echo "timeout")
+            if [ -n "$display_info" ] && [ "$display_info" != "timeout" ]; then
+                log_info "📺 Midscreen 屏幕信息: $display_info"
+            else
+                log_warn "📺 屏幕信息查询超时 (agent 首次初始化较慢, 正常现象)"
+            fi
+            log_info "📺 Midscene 日志文件: ${log_file}"
+            log_info "📺 查看日志可看到: 显示器列表、选中的显示器 ID、agent 初始化耗时"
+            
             return 0
         fi
         
