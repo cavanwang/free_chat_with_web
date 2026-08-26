@@ -12,6 +12,8 @@ gateway_common.py — qwen / deepseek 网关封装共用的纯逻辑
 
 import socket
 import time
+import json
+import re
 
 
 # ============ 端口占用检测 ============
@@ -103,6 +105,167 @@ def assemble_context(state, user_msg, header):
     return "\n\n".join(parts)
 
 
+# ============ 工具调用(function calling)文本化桥接 ============
+# 网页聊天本身没有 function-calling 协议, 这里用"哨兵起止符 + 每请求 nonce"把工具调用
+# 模拟成纯文本: 请求侧注入 tools 定义 + 协议说明; 响应侧把模型吐出的哨兵块解析回
+# OpenAI tool_calls。仅当调用方请求带 tools 时启用(agentic 客户端如 Trae)。
+
+def _tool_markers(nonce):
+    start = f"⟦⟦⟦TOOLCALL:{nonce}⟧⟧⟧"
+    end = f"⟦⟦⟦/TOOLCALL:{nonce}⟧⟧⟧"
+    return start, end
+
+
+def _content_to_text(content):
+    """把 OpenAI 消息 content(字符串 / content-parts 列表 / None)归一化为字符串。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(p.get("text", ""))
+            elif isinstance(p, str):
+                parts.append(p)
+        return "".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def tool_protocol_instruction(nonce):
+    """告诉模型:需要调用工具时,只输出本轮 nonce 哨兵包裹的一段 JSON。"""
+    start, end = _tool_markers(nonce)
+    return (
+        "你可以调用下列工具来完成任务(function calling)。\n"
+        "当你需要调用某个工具时, 必须【只】输出如下起止符包裹的一段 JSON, 起止符之外不要写任何文字:\n"
+        f"{start}\n"
+        '{"name": "工具名", "arguments": {参数对象}}\n'
+        f"{end}\n"
+        "要求: 1) 起止符必须原样成对出现, 不要改动其中的编号; "
+        "2) 中间只放一个合法 JSON 对象, name 为工具名, arguments 为参数对象(无参数则为 {}); "
+        "3) 一次只调用一个工具; "
+        "4) 若无需调用工具, 就正常用自然语言回答, 不要输出起止符。"
+    )
+
+
+def render_tools_as_text(tools):
+    """把 OpenAI tools(function schema 列表)渲染成文本块。无工具返回空串。"""
+    if not tools:
+        return ""
+    lines = ["<available_tools>"]
+    for t in tools:
+        fn = t.get("function", t) if isinstance(t, dict) else {}
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {})
+        lines.append(f"- name: {name}")
+        if desc:
+            lines.append(f"  description: {desc}")
+        try:
+            params_str = json.dumps(params, ensure_ascii=False)
+        except Exception:
+            params_str = str(params)
+        lines.append(f"  parameters(JSON Schema): {params_str}")
+    lines.append("</available_tools>")
+    return "\n".join(lines)
+
+
+TOOL_CONTEXT_HEADER = (
+    "下面是一次带工具调用的任务。<available_tools> 列出你可用的工具(含名称、说明、参数 JSON Schema); "
+    "<wxg_history> 内按顺序给出对话原文: <sys> 是系统指令, <user> 是用户消息, "
+    "<assistant> 是你之前的回答, <assistant_tool_call> 是你之前发起的工具调用, "
+    "<tool_result> 是工具执行结果。请在此背景上继续完成任务, 不要复述背景本身。"
+)
+
+
+def render_messages_for_tools(messages, tools, nonce, header=None):
+    """工具模式:直接用调用方发来的 messages(含 system / tool_calls / tool 结果)
+    渲染成一段待注入网页的文本。不走 SQLite 历史。"""
+    parts = []
+    parts.append(header or TOOL_CONTEXT_HEADER)
+    parts.append(tool_protocol_instruction(nonce))
+    tools_text = render_tools_as_text(tools)
+    if tools_text:
+        parts.append(tools_text)
+    parts.append("<wxg_history>")
+    for m in (messages or []):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "")
+        if role == "system":
+            parts.append(f"<sys>\n{xml_escape(_content_to_text(m.get('content')))}\n</sys>")
+        elif role == "user":
+            parts.append(f"<user>\n{xml_escape(_content_to_text(m.get('content')))}\n</user>")
+        elif role == "assistant":
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                nm = fn.get("name", "")
+                args = fn.get("arguments", "")
+                parts.append(
+                    f'<assistant_tool_call name="{xml_escape(str(nm))}">\n'
+                    f"{xml_escape(str(args))}\n</assistant_tool_call>"
+                )
+            c = _content_to_text(m.get("content"))
+            if c:
+                parts.append(f"<assistant>\n{xml_escape(c)}\n</assistant>")
+        elif role == "tool":
+            nm = m.get("name", "")
+            tcid = m.get("tool_call_id", "")
+            parts.append(
+                f'<tool_result name="{xml_escape(str(nm))}" id="{xml_escape(str(tcid))}">\n'
+                f"{xml_escape(_content_to_text(m.get('content')))}\n</tool_result>"
+            )
+    parts.append("</wxg_history>")
+    start, end = _tool_markers(nonce)
+    parts.append(
+        "现在请输出你的下一步。若需要调用工具, 【必须】只输出如下起止符包裹的一段 JSON, "
+        "起止符之外不要写任何字, 也【不要】用 ```json 代码块或 Action:/Action Input: 之类的格式:\n"
+        f"{start}\n"
+        '{"name": "工具名", "arguments": {参数对象}}\n'
+        f"{end}\n"
+        "一次只调用一个工具; 若无需工具, 直接用自然语言给出最终回答。"
+    )
+    return "\n\n".join(parts)
+
+
+def parse_tool_call(text, nonce):
+    """从模型输出中解析哨兵包裹的工具调用。
+    返回:
+      None                            -> 无工具调用(普通文本回答)
+      {"name":str, "arguments":dict}  -> 解析成功
+      ("error", 原因str)              -> 命中起止符但内容非法(供上层决定重试/降级)
+    """
+    if not text:
+        return None
+    start, end = _tool_markers(nonce)
+    si = text.find(start)
+    if si < 0:
+        return None
+    ei = text.find(end, si + len(start))
+    if ei < 0:
+        return ("error", "缺少结束哨兵(可能被截断)")
+    payload = text[si + len(start):ei].strip()
+    if payload.startswith("```"):
+        payload = payload.strip("`").strip()
+        nl = payload.find("\n")
+        if nl >= 0 and payload[:nl].strip().lower() in ("json", ""):
+            payload = payload[nl + 1:].strip()
+    try:
+        obj = json.loads(payload)
+    except Exception as e:
+        return ("error", f"JSON 解析失败: {e}")
+    if not isinstance(obj, dict) or "name" not in obj:
+        return ("error", "缺少 name 字段")
+    args = obj.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            pass
+    return {"name": obj.get("name"), "arguments": args if isinstance(args, dict) else {}}
+
+
 # ============ 单轮等待判定(超时/验证感知, 防无限等待) ============
 
 def new_wait_ctx():
@@ -170,3 +333,81 @@ def idle_decision(ctx, captcha_present, cur_len, has_body, idle_timeout,
     if now - ctx["last_active"] > grace:
         return ("break", f"{int(grace)}s 无新数据, 兜底结束")
     return ("continue", None)
+
+
+def parse_tool_calls(text, nonce):
+    """从模型输出解析工具调用, 兼容多种格式与并行多调用。
+    返回 (calls, note):
+      calls: list[{"name":str,"arguments":dict}], 空列表=无工具调用(普通文本)。
+      note:  命中来源 / 失败原因, 供日志观测遵从率。
+    """
+    if not text:
+        return [], "empty"
+
+    def _norm(obj):
+        if not isinstance(obj, dict):
+            return None
+        name = obj.get("name") or obj.get("tool") or obj.get("function")
+        if isinstance(name, dict):
+            name = name.get("name")
+        if not name:
+            return None
+        args = obj.get("arguments")
+        if args is None:
+            args = obj.get("parameters") or obj.get("args") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                pass
+        return {"name": name, "arguments": args if isinstance(args, dict) else {}}
+
+    def _collect(payload):
+        out = []
+        try:
+            data = json.loads(payload)
+        except Exception:
+            return out
+        items = data if isinstance(data, list) else [data]
+        for it in items:
+            n = _norm(it)
+            if n:
+                out.append(n)
+        return out
+
+    # 1) 哨兵包裹(主格式)
+    start, end = _tool_markers(nonce)
+    si = text.find(start)
+    if si >= 0:
+        ei = text.find(end, si + len(start))
+        payload = text[si + len(start): ei] if ei >= 0 else text[si + len(start):]
+        payload = payload.strip()
+        if payload.startswith("```"):
+            payload = payload.strip("`").strip()
+            nl = payload.find("\n")
+            if nl >= 0 and payload[:nl].strip().lower() in ("json", ""):
+                payload = payload[nl + 1:].strip()
+        calls = _collect(payload)
+        if calls:
+            return calls, ("sentinel" if ei >= 0 else "sentinel-no-end")
+
+    # 2) 兜底: ReAct  Action: X / Action Input: {json}
+    react = re.findall(r"Action\s*:\s*([A-Za-z0-9_\-]+)\s*Action\s*Input\s*:\s*(\{.*?\})", text, re.S)
+    if react:
+        calls = []
+        for name, argstr in react:
+            try:
+                args = json.loads(argstr)
+            except Exception:
+                args = {}
+            calls.append({"name": name, "arguments": args if isinstance(args, dict) else {}})
+        if calls:
+            return calls, "react"
+
+    # 3) 兜底: ```json 代码块内含 {name,arguments}(或其数组)
+    for block in re.findall(r"```(?:json)?\s*(.*?)```", text, re.S):
+        calls = _collect(block.strip())
+        if calls:
+            return calls, "fenced-json"
+
+    return [], "no-toolcall"

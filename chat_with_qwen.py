@@ -4382,7 +4382,7 @@ async def create_api_app():
     return app
 
 
-async def run_api_server(host: str, port: int):
+async def run_api_server(host: str, port: int, random_sessionid: bool = False):
     """启动 API 服务器"""
     global API_KEY
     log("脚本启动（API 模式）")
@@ -4399,6 +4399,11 @@ async def run_api_server(host: str, port: int):
         log(f"🗄️  会话历史库: {SESSION_DB_PATH}")
     except Exception as e:
         log(f"⚠️ 会话历史库初始化失败: {type(e).__name__}: {e}")
+
+    if random_sessionid:
+        global DEFAULT_CONVERSATION_ID
+        DEFAULT_CONVERSATION_ID = f"default-{uuid.uuid4().hex[:12]}"
+        log(f"🆕 本次启动随机默认会话id: {DEFAULT_CONVERSATION_ID}")
     chrome_proc = launch_chrome()
     attached = (chrome_proc is None)
 
@@ -4476,6 +4481,8 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=API_PORT, help=f"API 监听端口（默认 {API_PORT}）")
     parser.add_argument("--api-key", default=API_KEY, help="API 鉴权密钥（留空则不鉴权）")
     parser.add_argument("--model", default=API_MODEL, help=f"API 模型名（默认 {API_MODEL}）")
+    parser.add_argument("--random-sessionid", action="store_true",
+                        help="每次启动生成独立随机默认会话id, 不带conversation_id的请求纯新且互不串味")
     parser.add_argument("--midscene", dest="midscene", default=None,
                         help="启用 Midscene OS 级操作 (true/false, 优先级最高)")
     parser.add_argument("--midscene-url", dest="midscene_url", default=None,
@@ -4535,7 +4542,7 @@ if __name__ == "__main__":
 
     try:
         if args.api:
-            asyncio.run(run_api_server(args.host, args.port))
+            asyncio.run(run_api_server(args.host, args.port, args.random_sessionid))
         else:
             asyncio.run(main())
     except KeyboardInterrupt:

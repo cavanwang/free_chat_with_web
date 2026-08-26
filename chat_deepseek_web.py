@@ -7,6 +7,7 @@ import sys
 import time
 import socket
 import uuid
+import random
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 from playwright.async_api import async_playwright
@@ -48,13 +49,24 @@ STRIP_CITATIONS = True
 STREAM_OUTPUT = True
 PRINT_STREAM_PREFIX = True
 ENABLE_MODES = ["深度思考", "智能搜索"]
-DEFAULT_CHAT_MODE = ""  # "专家模式" 或 "识图模式"，留空保持默认
+DEFAULT_CHAT_MODE = "专家模式"  # "专家模式" 或 "识图模式"，留空保持默认
 # ===============================
+
+
+# run.log 文件句柄（追加模式，由 start_deepseek.sh 在启动时清空，保证 run.log 始终是本次启动期间的日志）
+RUN_LOG_PATH = Path(__file__).parent / "run.log"
+_run_log_file = open(RUN_LOG_PATH, "a", encoding="utf-8")
 
 
 def log(msg: str):
     ts = time.strftime("%Y-%m-%d %H:%M:%S") + f",{int(time.time() * 1000) % 1000:03d}"
-    print(f"[执行日志] {ts} {msg}", flush=True)
+    line = f"[执行日志] {ts} {msg}"
+    print(line, flush=True)
+    try:
+        _run_log_file.write(line + "\n")
+        _run_log_file.flush()
+    except Exception:
+        pass
 
 
 INPUT_SELECTORS = [
@@ -325,6 +337,43 @@ async def ensure_modes(page, mode_names):
     log("🎛️  模式设置完成")
 
 
+async def ensure_modes_off(page, mode_names):
+    """把指定模式确保切到【关闭】(仅当前为开启时才点一下)。
+    工具模式下用于关掉「深度思考」「智能搜索」, 让模型输出更干脆、更听格式约定。"""
+    log(f"🎛️  关闭模式: {mode_names}")
+    check_js = """(el) => {
+        if (!el) return false;
+        const p = el.getAttribute('aria-pressed');
+        const c = el.getAttribute('aria-checked');
+        if (p === 'true' || c === 'true') return true;
+        const cls = ((el.className||'')+' '+(el.parentElement&&el.parentElement.className||'')).toLowerCase();
+        return ['active','selected','checked','-on','enable','primary'].some(k=>cls.includes(k));
+    }"""
+    for name in mode_names:
+        try:
+            chip = None
+            for sel in [f'button:has-text("{name}")', f'[role="button"]:has-text("{name}")',
+                        f'div[role="switch"]:has-text("{name}")', f'span:has-text("{name}")']:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.count() > 0 and await loc.is_visible(timeout=1500):
+                        chip = loc
+                        break
+                except Exception:
+                    continue
+            if not chip:
+                continue
+            handle = await chip.element_handle()
+            if await page.evaluate(check_js, handle):
+                await chip.click()
+                await page.wait_for_timeout(500)
+                log(f"   🔘 已关闭「{name}」")
+            else:
+                log(f"   ✅ 「{name}」本就关闭")
+        except Exception as e:
+            log(f"   ❌ 关闭「{name}」出错: {e}")
+
+
 # ============================================================
 # 对话模式切换（快速模式 / 专家模式 / 识图模式）
 # ============================================================
@@ -411,6 +460,340 @@ async def start_new_chat(page):
     return page
 
 
+# ============================================================
+# 清空全部历史会话（模拟人类点击：展开侧边栏 → 多选 → 全选 → 删除 → 确认）
+# 说明：第一版带大量调试输出(按钮dump+截图)，便于按真实DOM固化选择器
+# ============================================================
+# ---- 人性化点击(随机延迟+鼠标轨迹, 降低被判定为机器人的风险) ----
+async def _human_delay(a=0.3, b=0.9):
+    try:
+        await asyncio.sleep(random.uniform(a, b))
+    except Exception:
+        pass
+
+
+async def _human_click_xy(page, x, y):
+    try:
+        await page.mouse.move(x, y, steps=random.randint(6, 16))
+        await _human_delay(0.12, 0.35)
+        await page.mouse.click(x, y, delay=random.randint(40, 130))
+    except Exception as e:
+        log(f"   ⚠️ 人性化点击异常: {e}")
+    await _human_delay(0.5, 1.5)
+
+
+async def _move_pause_click(page, x, y, pause=0.5):
+    """移动到坐标→停顿→点击(更像人对准按钮再按)。"""
+    try:
+        await page.mouse.move(x, y, steps=random.randint(8, 18))
+        await asyncio.sleep(pause + random.uniform(0.0, 0.3))
+        await page.mouse.click(x, y, delay=random.randint(50, 120))
+    except Exception as e:
+        log(f"   ⚠️ 移动停顿点击异常: {e}")
+
+
+async def _human_click(page, locator):
+    box = None
+    try:
+        box = await locator.bounding_box()
+    except Exception:
+        box = None
+    if box:
+        x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+        y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
+        await _human_click_xy(page, x, y)
+        return True
+    try:
+        await locator.click()
+        await _human_delay()
+        return True
+    except Exception as e:
+        log(f"   ⚠️ 点击异常: {e}")
+        return False
+
+
+async def _save_debug_shot(page, name):
+    try:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        d = Path("./debug_screenshots")
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"clearhist_{name}_{ts}.png"
+        await page.screenshot(path=str(path))
+        log(f"   📸 截图已存: {path}")
+    except Exception as e:
+        log(f"   ⚠️ 截图失败: {e}")
+
+
+async def _dump_buttons(page, label):
+    try:
+        infos = await page.evaluate(r"""() => {
+            const out = [];
+            const els = document.querySelectorAll('button,[role="button"],[role="checkbox"],[role="radio"],[role="menuitem"]');
+            els.forEach((b,i) => { if (i<150) out.push({
+                tag: b.tagName,
+                role: b.getAttribute('role'),
+                al: b.getAttribute('aria-label'),
+                ac: b.getAttribute('aria-checked'),
+                t: (b.innerText||'').replace(/\s+/g,' ').trim().slice(0,24),
+                cls: (b.getAttribute('class')||'').slice(0,60)
+            }); });
+            return out;
+        }""")
+        log(f"   🧩 [{label}] 可点击元素({len(infos)}):")
+        for it in infos:
+            log(f"       {it}")
+    except Exception as e:
+        log(f"   ⚠️ dump buttons[{label}] 失败: {e}")
+
+
+async def _sidebar_visible(page):
+    try:
+        nc = page.get_by_text("开启新对话", exact=False)
+        if await nc.count() > 0 and await nc.first.is_visible():
+            return True
+    except Exception:
+        pass
+    for t in ["今天", "昨天", "30 天内", "30天内", "7 天内"]:
+        try:
+            e = page.get_by_text(t, exact=False)
+            if await e.count() > 0 and await e.first.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _ensure_sidebar_open(page):
+    if await _sidebar_visible(page):
+        log("   ✅ 侧边栏已展开")
+        return True
+    log("   ▶ 侧边栏未展开, 点击左上角侧边栏开关...")
+    # DeepSeek 顶部图标按钮(div.ds-button--icon)无 aria-label/文本,
+    # 侧边栏开关是顶部区域最靠左的那个图标按钮
+    for attempt in range(3):
+        try:
+            await page.evaluate(r"""() => {
+                const btns = Array.from(document.querySelectorAll('.ds-button--icon'))
+                    .filter(b => { const r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0 && r.top < 150; });
+                if (!btns.length) return false;
+                btns.sort((a,b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+                btns[0].click();
+                return true;
+            }""")
+        except Exception as e:
+            log(f"   ⚠️ 点击侧边栏开关异常: {e}")
+        await page.wait_for_timeout(900)
+        if await _sidebar_visible(page):
+            log(f"   ✅ 侧边栏已展开(左上角图标, 第{attempt+1}次)")
+            return True
+    log("   ⚠️ 未能展开侧边栏, dump+截图供排查")
+    await _dump_buttons(page, "sidebar-toggle")
+    await _save_debug_shot(page, "sidebar")
+    return await _sidebar_visible(page)
+
+
+async def _in_multiselect(page):
+    for t in ["选择对话", "已选择"]:
+        try:
+            e = page.get_by_text(t, exact=False)
+            if await e.count() > 0 and await e.first.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _open_multiselect(page):
+    if await _in_multiselect(page):
+        return True
+    # 语义定位: 侧边栏第一个分组标题(今天/昨天/N天内/YYYY-MM)行内、右侧的图标按钮
+    res = await page.evaluate(r"""() => {
+        const nodes = Array.from(document.querySelectorAll('div,span,p'));
+        let header = null;
+        for (const e of nodes) {
+            if (e.children.length) continue;
+            const t = (e.textContent || '').trim();
+            if (/^(今天|昨天|前天|近\d+天|\d+\s*天内|\d{4}-\d{2})$/.test(t)) {
+                const r = e.getBoundingClientRect();
+                if (r.top > 0 && r.left < window.innerWidth * 0.4) { header = e; break; }
+            }
+        }
+        if (!header) return {err: 'no-header'};
+        const hr = header.getBoundingClientRect();
+        const hcy = hr.top + hr.height / 2;
+        const icons = Array.from(document.querySelectorAll('.ds-button--icon')).filter(b => {
+            const r = b.getBoundingClientRect();
+            return r.width > 0 && Math.abs((r.top + r.height / 2) - hcy) < 26 && r.left > hr.left;
+        });
+        if (!icons.length) return {err: 'no-icon-in-row', headerText: header.textContent.trim(), headerTop: Math.round(hr.top)};
+        icons.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+        const r = icons[0].getBoundingClientRect();
+        return {x: r.x + r.width / 2, y: r.y + r.height / 2, headerText: header.textContent.trim()};
+    }""")
+    log(f"   🔎 多选按钮定位结果: {res}")
+    if isinstance(res, dict) and "x" in res:
+        await _human_click_xy(page, res["x"], res["y"])
+        await page.wait_for_timeout(700)
+        if await _in_multiselect(page):
+            log("   ✅ 已进入多选态(分组标题行图标)")
+            return True
+    log("   ⚠️ 未能进入多选态, dump 按钮供排查")
+    await _dump_buttons(page, "multiselect-entry")
+    await _save_debug_shot(page, "multiselect_entry")
+    return False
+
+
+async def _select_all_history(page):
+    """多选态下, 逐个勾选未选中的会话行(点行内勾选区, 靠 <a> 的 aria-pressed 判断选中)。
+    每轮最多勾 10 项; 每次重新定位第一个未选中行, 避免重复点击把已选的取消。"""
+    clicked = 0
+    for _ in range(50):
+        box = await page.evaluate(r"""() => {
+            const rows = Array.from(document.querySelectorAll('a[aria-pressed]'));
+            for (const a of rows) {
+                if (a.getAttribute('aria-pressed') === 'true') continue;
+                const r = a.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+                if (r.top < 60 || r.bottom > window.innerHeight - 40) continue;
+                const cb = a.querySelector('[class*=checkbox]');
+                const cr = cb ? cb.getBoundingClientRect() : r;
+                return {x: cr.x + cr.width / 2, y: cr.y + cr.height / 2, text: (a.innerText || '').replace(/\s+/g, ' ').slice(0, 20)};
+            }
+            return null;
+        }""")
+        if not box:
+            break
+        try:
+            await page.mouse.move(box["x"], box["y"], steps=random.randint(3, 7))
+            await page.mouse.click(box["x"], box["y"], delay=random.randint(30, 80))
+        except Exception:
+            pass
+        await _human_delay(0.15, 0.3)
+        clicked += 1
+    log(f"   ✅ 本轮勾选 {clicked} 项")
+    return clicked
+
+
+async def _delete_dialog_visible(page):
+    for t in ["删除选择的", "不可恢复", "不可恢復"]:
+        try:
+            e = page.get_by_text(t, exact=False)
+            if await e.count() > 0 and await e.first.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _click_delete_toolbar(page):
+    """鼠标移到底部工具栏'删除'→停0.5s→点击, 触发确认弹窗。"""
+    box = await page.evaluate(r"""() => {
+        const btns = Array.from(document.querySelectorAll('button')).filter(b => {
+            const t = (b.innerText || '').trim();
+            const r = b.getBoundingClientRect();
+            return t === '删除' && r.width > 0 && r.height > 0;
+        });
+        if (!btns.length) return null;
+        btns.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+        const r = btns[0].getBoundingClientRect();
+        return {x: r.x + r.width / 2, y: r.y + r.height / 2, n: btns.length};
+    }""")
+    log(f"   🗑️ 工具栏删除按钮定位: {box}")
+    if box:
+        await _move_pause_click(page, box["x"], box["y"], pause=0.5)
+        for _ in range(8):
+            if await _delete_dialog_visible(page):
+                log("   ✅ 已点击工具栏删除, 确认弹窗已出现")
+                return True
+            await page.wait_for_timeout(350)
+    log("   ⚠️ 未能点击工具栏删除或未弹出确认框")
+    await _dump_buttons(page, "delete-toolbar")
+    await _save_debug_shot(page, "delete_toolbar")
+    return False
+
+
+async def _confirm_delete(page):
+    """在确认弹窗内定位红色'删除'(可能是 div.ds-button), 鼠标移过去→停0.5s→点击→等2秒完成删除。"""
+    box = await page.evaluate(r"""() => {
+        const marker = Array.from(document.querySelectorAll('*')).find(e => {
+            const t = (e.textContent || '');
+            return t.includes('不可恢复') || t.includes('删除选择的');
+        });
+        let dlg = marker;
+        for (let i = 0; i < 8 && dlg; i++) {
+            const c = dlg.querySelectorAll('button,[role=button],.ds-button');
+            if (c.length >= 2) break;
+            dlg = dlg.parentElement;
+        }
+        const scope = dlg || document;
+        const cbtns = Array.from(scope.querySelectorAll('button,[role=button],.ds-button')).filter(b => {
+            const t = (b.innerText || b.textContent || '').trim();
+            const r = b.getBoundingClientRect();
+            return t === '删除' && r.width > 0 && r.height > 0;
+        });
+        if (!cbtns.length) {
+            const dbg = Array.from(scope.querySelectorAll('button,[role=button],.ds-button')).map(b => ({t: (b.innerText || b.textContent || '').trim().slice(0, 10), tag: b.tagName})).slice(0, 8);
+            return {err: 'no-del-btn', scoped: !!dlg, dbg: dbg};
+        }
+        cbtns.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+        const r = cbtns[0].getBoundingClientRect();
+        return {x: r.x + r.width / 2, y: r.y + r.height / 2, n: cbtns.length, scoped: !!dlg};
+    }""")
+    log(f"   ✔️ 弹窗删除按钮定位: {box}")
+    if isinstance(box, dict) and "x" in box:
+        await _move_pause_click(page, box["x"], box["y"], pause=0.5)
+        await page.wait_for_timeout(2000)
+        log("   ✅ 已在弹窗确认删除(已等待2秒)")
+        return True
+    log("   ⚠️ 未能定位弹窗删除按钮")
+    await _dump_buttons(page, "confirm-dialog")
+    await _save_debug_shot(page, "confirm_dialog")
+    return False
+
+
+async def clear_all_history(page):
+    """分批循环清空全部历史(应对虚拟滚动)。每轮: 回首页→展开→进多选→勾选可见→删除→确认。
+    结束条件: 进不了多选态 或 本轮勾选 0 项(视为已无历史)。不再依赖单一 locator 计数做判据。"""
+    log("🧹 开始清空全部历史会话(分批循环, 应对虚拟滚动)...")
+    MAX_ROUNDS = 60
+    for rnd in range(1, MAX_ROUNDS + 1):
+        if not await _reset_to_home(page):
+            log("   ⚠️ 无法回到首页, 中止")
+            return False
+        await page.wait_for_timeout(800)
+        await _ensure_sidebar_open(page)
+        # 等待侧栏列表渲染, 打印计数明细(仅供观察, 不作判据)
+        # 等待侧栏列表渲染出来
+        for _ in range(10):
+            try:
+                ready = await page.evaluate("() => document.querySelectorAll('a[aria-pressed], a[role=button]').length > 0")
+            except Exception:
+                ready = False
+            if ready:
+                break
+            await page.wait_for_timeout(400)
+        log(f"   —— 第 {rnd} 轮 ——")
+        if not await _open_multiselect(page):
+            log("   ℹ️ 未进入多选态(视为已无历史或需排查), 结束")
+            await _save_debug_shot(page, "after")
+            return True
+        n = await _select_all_history(page)
+        if n == 0:
+            log("   ℹ️ 本轮勾选 0 项, 判定已清空, 结束")
+            await _save_debug_shot(page, "after")
+            return True
+        if not await _click_delete_toolbar(page):
+            log("   ❌ 点击删除失败, 中止")
+            return False
+        if not await _confirm_delete(page):
+            log("   ❌ 确认删除失败, 中止")
+            return False
+        await page.wait_for_timeout(1300)
+    log("🧹 历史会话清空流程结束(达到轮数上限)")
+    await _save_debug_shot(page, "after")
+    return True
+
+
 async def switch_chat_mode(page, mode_name):
     log(f"🔄 切换对话模式 → 「{mode_name}」")
     target_type = CHAT_MODE_MAP.get(mode_name)
@@ -459,6 +842,7 @@ HOOK_JS_V8 = r"""
     window.__ds_finished = false;
     window.__ds_lastTextLen = 0;
     window.__ds_hookSource = '';
+    window.__ds_raw_sse = '';
 
     function stripCitations(text) {
         if (window.__ds_strip_citations) {
@@ -473,6 +857,7 @@ HOOK_JS_V8 = r"""
         let done = false;
 
         function processChunk(text) {
+            window.__ds_raw_sse = (window.__ds_raw_sse || '') + text;
             if (done) return;
             cursor_text += text;
             window.__ds_lastTextLen = (window.__ds_lastTextLen || 0) + text.length;
@@ -768,6 +1153,7 @@ async def stream_chat_gen(page, send_coro, round_num, idle_timeout=3):
         window.__ds_finished = false;
         window.__ds_lastTextLen = 0;
         window.__ds_hookSource = '';
+        window.__ds_raw_sse = '';
     """)
     log(f"Hook: {hook_result}")
 
@@ -865,6 +1251,14 @@ async def stream_chat_gen(page, send_coro, round_num, idle_timeout=3):
             content += f"=== 正文 ===\n{final_body}"
             f.write_text(content, encoding="utf-8")
             log(f"📄 已保存: {f.resolve()}")
+            try:
+                await page.wait_for_timeout(1000)  # 宽限: 捕获 FINISHED 之后可能仍到达的 SSE
+                raw_sse = await page.evaluate("() => window.__ds_raw_sse || ''")
+                rf = RAW_DUMP_DIR / f"round{round_num}_raw_sse.txt"
+                rf.write_text(raw_sse, encoding="utf-8")
+                log(f"📄 已保存原始SSE: {rf.name} ({len(raw_sse)} 字符)")
+            except Exception as e:
+                log(f"⚠️ 保存原始SSE失败: {type(e).__name__}: {e}")
 
         yield ("done", {"body": final_body, "think": final_think, "reason": end_reason,
                          "chunk_count": chunk_count, "think_count": think_count})
@@ -1075,7 +1469,7 @@ def _build_chat_chunk(content: str = "", reasoning: str = "", model: str = "deep
 
 
 def _build_chat_response(content: str, reasoning: str, model: str, chat_id: str,
-                         usage: Optional[dict] = None) -> dict:
+                         usage: Optional[dict] = None, tool_calls: Optional[list] = None) -> dict:
     if usage is None:
         prompt_tokens = estimate_tokens(reasoning) + estimate_tokens(content)
         usage = {
@@ -1092,10 +1486,11 @@ def _build_chat_response(content: str, reasoning: str, model: str, chat_id: str,
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": content,
+                "content": (None if tool_calls else content),
                 **({"reasoning_content": reasoning} if reasoning else {}),
+                **({"tool_calls": tool_calls} if tool_calls else {}),
             },
-            "finish_reason": "stop",
+            "finish_reason": ("tool_calls" if tool_calls else "stop"),
         }],
         "usage": usage,
     }
@@ -1144,6 +1539,13 @@ def create_app():
             if m.get("role") == "user":
                 user_msg = m.get("content", "")
                 break
+        # 兼容 OpenAI content-parts(list)格式: 归一化为字符串, 纯字符串保持不变
+        if isinstance(user_msg, list):
+            user_msg = "".join(
+                part.get("text", "")
+                for part in user_msg
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
         if not user_msg:
             return JSONResponse(status_code=400, content={"error": {"message": "No user message found"}})
 
@@ -1153,6 +1555,9 @@ def create_app():
         # 会话正本由网关持有: conversation_id 标识调用方逻辑会话(与 qwen 共享同一库)
         cid = body.get("conversation_id") or DEFAULT_CONVERSATION_ID
         new_session = body.get("new_session", False)
+        tools = body.get("tools")
+        use_tools = bool(tools)
+        tool_nonce = uuid.uuid4().hex[:8] if use_tools else ""
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
         page = _app_state["page"]
@@ -1165,21 +1570,45 @@ def create_app():
             session_store.clear(SESSION_DB_PATH, cid)
             log(f"🔄 API 清空会话历史 cid={cid}")
 
-        # 取历史正本, 拼装[摘要+最近K轮+本轮]
-        state = session_store.load(SESSION_DB_PATH, cid)
-        injected = gwc.assemble_context(state, user_msg, CONTEXT_HEADER)
+        # 工具模式(请求带 tools): 直接用 messages 渲染, 不走 SQLite 历史
+        if use_tools:
+            injected = gwc.render_messages_for_tools(messages, tools, tool_nonce)
+        else:
+            # 取历史正本, 拼装[摘要+最近K轮+本轮]
+            state = session_store.load(SESSION_DB_PATH, cid)
+            injected = gwc.assemble_context(state, user_msg, CONTEXT_HEADER)
 
         _app_state["round_counter"] += 1
         round_num = _app_state["round_counter"]
         log(f"===== 第 {round_num} 轮 (API) cid={cid} 注入~{estimate_tokens(injected)} tokens =====")
+        log(f"   stream={stream}, use_tools={use_tools}")
+        # 请求正文单独落盘(独立 req 文件, 不混入 run.log), 与 round{N}_stream.txt 响应配套排查
+        if DUMP_RAW:
+            try:
+                RAW_DUMP_DIR.mkdir(exist_ok=True)
+                (RAW_DUMP_DIR / f"round{round_num}_request.txt").write_text(injected, encoding="utf-8")
+            except Exception as e:
+                log(f"⚠️ 保存请求失败: {type(e).__name__}: {e}")
 
         mode_to_label = {"default": "快速模式", "expert": "专家模式", "vision": "识图模式"}
 
         async def _ensure_mode(p):
-            if not req_mode:
+            # Trae 等不传 mode 时, 每轮回退到默认模式(DEFAULT_CHAT_MODE=专家模式), 防止新对话回落到快速模式
+            label = mode_to_label.get(req_mode, req_mode) if req_mode else DEFAULT_CHAT_MODE
+            if not label:
                 return
-            label = mode_to_label.get(req_mode, req_mode)
             await switch_chat_mode(p, label)
+
+        async def _apply_modes(p):
+            # 统一模式策略: 每轮先切 chat 模式(专家模式), 再按是否工具调用设定思考/搜索开关
+            await _ensure_mode(p)
+            if use_tools:
+                # 工具调用: 只用专家模式, 关深度思考(输出干脆)与智能搜索(不触发 DEEP_SEARCH 打开本地文件)
+                await ensure_modes_off(p, ["深度思考", "智能搜索"])
+            else:
+                # 内容理解: 专家模式 + 深度思考; 智能搜索仍关闭(避免联网打开本地文件)
+                await ensure_modes(p, ["深度思考"])
+                await ensure_modes_off(p, ["智能搜索"])
 
         def _persist_and_usage(final_body, final_think):
             """落库(user+assistant)并返回 usage; 无有效回复则不落库, 避免污染上下文。"""
@@ -1210,7 +1639,7 @@ def create_app():
                 # 先开干净会话(导航回首页), 再切模式, 最后注入拼好的上下文
                 p = await start_new_chat(page)
                 _app_state["page"] = p
-                await _ensure_mode(p)
+                await _apply_modes(p)
                 try:
                     async for kind, data in stream_chat_gen(p, do_send(p, injected), round_num):
                         if kind == "body":
@@ -1237,7 +1666,7 @@ def create_app():
                 yield f"data: {json.dumps(_build_chat_chunk(model=model, chunk_id=chat_id, finish='stop', usage=usage), ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
 
-        if stream:
+        if stream and not use_tools:
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
         final_body = ""
@@ -1246,7 +1675,7 @@ def create_app():
             try:
                 p = await start_new_chat(page)
                 _app_state["page"] = p
-                await _ensure_mode(p)
+                await _apply_modes(p)
                 async for kind, data in stream_chat_gen(p, do_send(p, injected), round_num):
                     if kind == "body":
                         final_body += data
@@ -1258,6 +1687,66 @@ def create_app():
             except Exception as e:
                 log(f"❌ API 非流式异常: {type(e).__name__}: {e}")
                 return JSONResponse(status_code=500, content={"error": {"message": str(e)}})
+
+        # ===== 工具模式: 不落 SQLite / 不压缩; 只用正文解析 -> OpenAI tool_calls; 不回传思考 =====
+        if use_tools:
+            prompt_tok = estimate_tokens(injected)
+            body_tok = estimate_tokens(final_body)
+            usage = {
+                "prompt_tokens": prompt_tok,
+                "completion_tokens": body_tok,
+                "total_tokens": prompt_tok + body_tok,
+                "conversation_id": cid,
+            }
+            # 哨兵可能落在思考区(关深度思考后 body 常为空), 合并 think+body 一起解析; nonce 防误命中
+            combined = ((final_think or "") + "\n" + (final_body or "")).strip()
+            calls, note = gwc.parse_tool_calls(combined, tool_nonce)
+            if calls:
+                tool_calls = []
+                for c in calls:
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:24]}",
+                        "type": "function",
+                        "function": {
+                            "name": c["name"],
+                            "arguments": json.dumps(c.get("arguments", {}), ensure_ascii=False),
+                        },
+                    })
+                names = ", ".join(t["function"]["name"] for t in tool_calls)
+                log(f"🔧 解析到 {len(tool_calls)} 个工具调用({note}): {names}")
+                if stream:
+                    # 流式回放: 先发带 tool_calls 的 delta, 再发 finish=tool_calls
+                    async def _toolcalls_sse():
+                        delta_tcs = [
+                            {"index": i, "id": t["id"], "type": "function",
+                             "function": {"name": t["function"]["name"],
+                                          "arguments": t["function"]["arguments"]}}
+                            for i, t in enumerate(tool_calls)
+                        ]
+                        first = {
+                            "id": chat_id, "object": "chat.completion.chunk",
+                            "created": int(time.time()), "model": model,
+                            "choices": [{"index": 0,
+                                         "delta": {"role": "assistant", "content": None, "tool_calls": delta_tcs},
+                                         "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps(_build_chat_chunk(model=model, chunk_id=chat_id, finish='tool_calls', usage=usage), ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                    return StreamingResponse(_toolcalls_sse(), media_type="text/event-stream")
+                # 非流式: 只回传 tool_calls, 不含思考过程
+                return _build_chat_response("", "", model, chat_id, usage=usage, tool_calls=tool_calls)
+            # 未命中: 正文空则回退用思考区内容, 保证 Trae 不拿到空回复
+            content_out = final_body if (final_body and final_body.strip()) else final_think
+            log(f"⚠️ 工具模式未解析到调用({note}); combined[:200]={combined[:200]!r}")
+            if stream:
+                async def _content_sse():
+                    if content_out:
+                        yield f"data: {json.dumps(_build_chat_chunk(content=content_out, model=model, chunk_id=chat_id), ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps(_build_chat_chunk(model=model, chunk_id=chat_id, finish='stop', usage=usage), ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                return StreamingResponse(_content_sse(), media_type="text/event-stream")
+            return _build_chat_response(content_out, "", model, chat_id, usage=usage)
 
         usage = _persist_and_usage(final_body, final_think)
         compacted = False
@@ -1288,7 +1777,7 @@ def create_app():
     return app
 
 
-async def run_api_server(host: str, port: int):
+async def run_api_server(host: str, port: int, clear_history: bool = False, random_sessionid: bool = False):
     import uvicorn
 
     log("脚本启动（API 模式）")
@@ -1308,6 +1797,11 @@ async def run_api_server(host: str, port: int):
         log(f"🗄️  会话历史库: {SESSION_DB_PATH} (与 qwen 共享)")
     except Exception as e:
         log(f"⚠️ 会话历史库初始化失败: {type(e).__name__}: {e}")
+
+    if random_sessionid:
+        global DEFAULT_CONVERSATION_ID
+        DEFAULT_CONVERSATION_ID = f"default-{uuid.uuid4().hex[:12]}"
+        log(f"🆕 本次启动随机默认会话id: {DEFAULT_CONVERSATION_ID}")
     chrome_proc = launch_chrome()
     attached = (chrome_proc is None)
 
@@ -1326,6 +1820,10 @@ async def run_api_server(host: str, port: int):
             log("❌ 登录超时")
             await browser.close()
             return
+
+        if clear_history:
+            await clear_all_history(page)
+            await start_new_chat(page)
 
         input_el = await find_element(page, INPUT_SELECTORS, "输入框")
         if not input_el:
@@ -1375,11 +1873,14 @@ async def main():
     parser.add_argument("--host", default=API_HOST, help=f"API 监听地址（默认 {API_HOST}）")
     parser.add_argument("--port", type=int, default=API_PORT, help=f"API 监听端口（默认 {API_PORT}）")
     parser.add_argument("--api-key", default=API_KEY, help="API 鉴权密钥（留空则不鉴权）")
+    parser.add_argument("--clear-history", action="store_true", help="启动时先清空全部历史会话, 再开一个干净的新会话")
+    parser.add_argument("--random-sessionid", action="store_true",
+                        help="每次启动生成独立随机默认会话id, 不带conversation_id的请求纯新且互不串味")
     args = parser.parse_args()
 
     if args.api:
         API_KEY = args.api_key
-        await run_api_server(args.host, args.port)
+        await run_api_server(args.host, args.port, args.clear_history, args.random_sessionid)
         return
 
     log("脚本启动")
@@ -1401,6 +1902,10 @@ async def main():
             log("❌ 登录超时")
             await browser.close()
             return
+
+        if args.clear_history:
+            await clear_all_history(page)
+            await start_new_chat(page)
 
         input_el = await find_element(page, INPUT_SELECTORS, "输入框")
         if not input_el:

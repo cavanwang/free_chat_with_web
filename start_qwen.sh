@@ -23,6 +23,7 @@ API_PORT=8765
 MIDSCENE_PORT=3456
 ENABLE_MIDSCENE=true
 API_MODE=false
+RANDOM_SESSIONID=false
 FORCE_RESTART=true
 
 # ============ Midscene 模型默认配置(千问 DashScope) ============
@@ -51,13 +52,17 @@ while [[ $# -gt 0 ]]; do
             FORCE_RESTART=true
             shift
             ;;
+        --random-sessionid)
+            RANDOM_SESSIONID=true
+            shift
+            ;;
         --midscene-port)
             MIDSCENE_PORT="$2"
             shift 2
             ;;
         *)
             echo "未知参数: $1"
-            echo "用法: $0 [--api] [--port PORT] [--no-midscene] [--force-restart]"
+            echo "用法: $0 [--api] [--port PORT] [--no-midscene] [--force-restart] [--random-sessionid]"
             exit 1
             ;;
     esac
@@ -281,6 +286,10 @@ start_chat() {
     
     if [ "$API_MODE" = "true" ]; then
         cmd="$cmd --api --port $API_PORT $midscene_args"
+        if [ "$RANDOM_SESSIONID" = "true" ]; then
+            cmd="$cmd --random-sessionid"
+            log_info "已启用: 每次启动使用独立随机默认会话 (--random-sessionid)"
+        fi
         log_info "API 模式 (端口 $API_PORT)"
     else
         log_info "交互式模式"
