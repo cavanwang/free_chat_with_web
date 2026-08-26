@@ -50,6 +50,7 @@ STREAM_OUTPUT = True
 PRINT_STREAM_PREFIX = True
 ENABLE_MODES = ["深度思考", "智能搜索"]
 DEFAULT_CHAT_MODE = "专家模式"  # "专家模式" 或 "识图模式"，留空保持默认
+WEB_INPUT_MAX_CHARS = 150000  # 网页输入框字符上限(实测 ~164K, 留余量); 超过则直接返回 context_length_exceeded
 # ===============================
 
 
@@ -1570,9 +1571,18 @@ def create_app():
             session_store.clear(SESSION_DB_PATH, cid)
             log(f"🔄 API 清空会话历史 cid={cid}")
 
-        # 工具模式(请求带 tools): 直接用 messages 渲染, 不走 SQLite 历史
+        # 工具模式(请求带 tools): 直接用 messages 渲染, 不走 SQLite 历史; 超预算则先裁剪再退回报错
+        fit_note = ""
         if use_tools:
-            injected = gwc.render_messages_for_tools(messages, tools, tool_nonce)
+            injected, fit_note = gwc.fit_messages_for_tools(messages, tools, tool_nonce, WEB_INPUT_MAX_CHARS)
+            if injected is None:
+                log(f"⚠️ 工具注入裁剪后仍超预算({fit_note}), 返回 context_length_exceeded")
+                return JSONResponse(status_code=400, content={"error": {
+                    "message": f"输入超过网页版上限 {WEB_INPUT_MAX_CHARS} 字符且无法裁剪, 请压缩会话后重试。",
+                    "type": "invalid_request_error",
+                    "param": "messages",
+                    "code": "context_length_exceeded",
+                }})
         else:
             # 取历史正本, 拼装[摘要+最近K轮+本轮]
             state = session_store.load(SESSION_DB_PATH, cid)
@@ -1582,6 +1592,8 @@ def create_app():
         round_num = _app_state["round_counter"]
         log(f"===== 第 {round_num} 轮 (API) cid={cid} 注入~{estimate_tokens(injected)} tokens =====")
         log(f"   stream={stream}, use_tools={use_tools}")
+        if use_tools and fit_note and fit_note != "fit":
+            log(f"   ✂️ 注入裁剪: {fit_note}")
         # 请求正文单独落盘(独立 req 文件, 不混入 run.log), 与 round{N}_stream.txt 响应配套排查
         if DUMP_RAW:
             try:
@@ -1589,6 +1601,16 @@ def create_app():
                 (RAW_DUMP_DIR / f"round{round_num}_request.txt").write_text(injected, encoding="utf-8")
             except Exception as e:
                 log(f"⚠️ 保存请求失败: {type(e).__name__}: {e}")
+
+        # 超长守卫: 注入超过网页输入上限则直接返回 OpenAI 标准错误(不碰浏览器, 避免填不进去导致的卡死/刷屏)
+        if len(injected) > WEB_INPUT_MAX_CHARS:
+            log(f"⚠️ 注入超长 {len(injected)} 字符 > 上限 {WEB_INPUT_MAX_CHARS}, 返回 context_length_exceeded")
+            return JSONResponse(status_code=400, content={"error": {
+                "message": f"输入长度 {len(injected)} 超过网页版上限 {WEB_INPUT_MAX_CHARS} 字符, 请压缩会话后重试。",
+                "type": "invalid_request_error",
+                "param": "messages",
+                "code": "context_length_exceeded",
+            }})
 
         mode_to_label = {"default": "快速模式", "expert": "专家模式", "vision": "识图模式"}
 
@@ -1600,15 +1622,10 @@ def create_app():
             await switch_chat_mode(p, label)
 
         async def _apply_modes(p):
-            # 统一模式策略: 每轮先切 chat 模式(专家模式), 再按是否工具调用设定思考/搜索开关
+            # 统一模式策略: 专家模式 + 深度思考(始终开, 模型才会吐工具调用) + 智能搜索(始终关, 避免 DEEP_SEARCH 打开本地文件)
             await _ensure_mode(p)
-            if use_tools:
-                # 工具调用: 只用专家模式, 关深度思考(输出干脆)与智能搜索(不触发 DEEP_SEARCH 打开本地文件)
-                await ensure_modes_off(p, ["深度思考", "智能搜索"])
-            else:
-                # 内容理解: 专家模式 + 深度思考; 智能搜索仍关闭(避免联网打开本地文件)
-                await ensure_modes(p, ["深度思考"])
-                await ensure_modes_off(p, ["智能搜索"])
+            await ensure_modes(p, ["深度思考"])
+            await ensure_modes_off(p, ["智能搜索"])
 
         def _persist_and_usage(final_body, final_think):
             """落库(user+assistant)并返回 usage; 无有效回复则不落库, 避免污染上下文。"""
@@ -1699,8 +1716,47 @@ def create_app():
                 "conversation_id": cid,
             }
             # 哨兵可能落在思考区(关深度思考后 body 常为空), 合并 think+body 一起解析; nonce 防误命中
+            _tool_names = [
+                (t.get("function") or {}).get("name")
+                for t in (tools or []) if isinstance(t, dict)
+            ]
+            _tool_names = [n for n in _tool_names if n]
             combined = ((final_think or "") + "\n" + (final_body or "")).strip()
-            calls, note = gwc.parse_tool_calls(combined, tool_nonce)
+            calls, note = gwc.parse_tool_calls(combined, tool_nonce, _tool_names)
+            # 归一化兜底: 本地解析器没解析出工具调用, 但输出里疑似有调用意图时,
+            # 把这段原始输出【无历史】地扔回模型, 只做一次"格式规范化"(比重跑整任务更稳, 不会再次跑偏)。
+            def _looks_like_attempt(t):
+                if not t:
+                    return False
+                if _tool_names and any(n in t for n in _tool_names):
+                    return True
+                return ("<" in t and ">" in t) or ('"name"' in t) or ("arguments" in t)
+            if not calls and _looks_like_attempt(combined):
+                log(f"🔧 本地未解析({note}), 触发工具调用归一化兜底")
+                norm_prompt = gwc.build_normalizer_prompt(combined, _tool_names)
+                nb, nt = "", ""
+                async with lock:
+                    try:
+                        p = await start_new_chat(page)
+                        _app_state["page"] = p
+                        await _apply_modes(p)
+                        async for kind, data in stream_chat_gen(p, do_send(p, norm_prompt), round_num):
+                            if kind == "body":
+                                nb += data
+                            elif kind == "think":
+                                nt += data
+                            elif kind == "done":
+                                nb = data.get("body", nb)
+                                nt = data.get("think", nt)
+                    except Exception as e:
+                        log(f"⚠️ 归一化兜底异常: {type(e).__name__}: {e}")
+                norm_out = ((nb or "") + "\n" + (nt or "")).strip()
+                ncalls, nnote = gwc.parse_tool_calls(norm_out, tool_nonce, _tool_names)
+                if ncalls:
+                    log(f"✅ 归一化成功解析到 {len(ncalls)} 个调用({nnote})")
+                    calls, note = ncalls, "normalized"
+                else:
+                    log(f"⚠️ 归一化后仍未解析到调用({nnote}); norm_out[:120]={norm_out[:120]!r}")
             if calls:
                 tool_calls = []
                 for c in calls:
