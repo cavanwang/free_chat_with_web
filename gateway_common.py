@@ -308,6 +308,15 @@ def fit_messages_for_tools(messages, tools, nonce, budget_chars, per_result_cap=
 
     msgs = [dict(m) for m in (messages or [])]
 
+    def _assemble(truncated, dropped):
+        """按"最终会注入的完整串"(含提示语)来渲染, 使长度衡量与实际返回一致,
+        避免提示语在预算检查之后才拼上导致溢出。"""
+        inj = render_messages_for_tools(msgs, tools, nonce)
+        if truncated or dropped:
+            notice = f"(注: 为适应长度限制, 已截断 {truncated} 条超大工具结果、省略最早 {dropped} 条工具结果。)\n\n"
+            inj = notice + inj
+        return inj
+
     # 1) 截断超大的单条 tool 结果(含最新的; 过长文件只保留前 per_result_cap 字符)
     truncated = 0
     for m in msgs:
@@ -316,26 +325,23 @@ def fit_messages_for_tools(messages, tools, nonce, budget_chars, per_result_cap=
             if len(c) > per_result_cap:
                 m["content"] = c[:per_result_cap] + "\n…[工具结果过长, 已截断]"
                 truncated += 1
-    injected = render_messages_for_tools(msgs, tools, nonce)
 
-    # 2) 从最老起逐条丢弃 tool 结果(文件内容是大头; assistant 的调用记录很小, 保留)
+    # 2) 从最老起逐条丢弃 tool 结果, 每次都按"含提示语"的完整长度衡量
     dropped = 0
+    injected = _assemble(truncated, dropped)
     while len(injected) > budget_chars:
         idx = next((i for i, m in enumerate(msgs) if m.get("role") == "tool"), None)
         if idx is None:
             break
         msgs.pop(idx)
         dropped += 1
-        injected = render_messages_for_tools(msgs, tools, nonce)
+        injected = _assemble(truncated, dropped)
 
     if len(injected) > budget_chars:
         return None, f"over-budget:{len(injected)}(truncated={truncated},dropped={dropped})"
 
-    if truncated or dropped:
-        notice = f"(注: 为适应长度限制, 已截断 {truncated} 条超大工具结果、省略最早 {dropped} 条工具结果。)\n\n"
-        injected = notice + injected
-        return injected, f"trimmed(truncated={truncated},dropped={dropped})"
-    return injected, "fit"
+    note = f"trimmed(truncated={truncated},dropped={dropped})" if (truncated or dropped) else "fit"
+    return injected, note
 
 
 def parse_tool_call(text, nonce):
